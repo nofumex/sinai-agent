@@ -809,33 +809,45 @@ class AmoClient:
 
         # Use a clean request here so the amoCRM Authorization header is never sent to telephony hosts.
         logger.info("Downloading audio: lead={} note={} url={}", candidate.lead_id, candidate.note_id, candidate.audio_url)
+        connect_timeout = env_int("AUDIO_CONNECT_TIMEOUT", 30)
+        read_timeout = env_int("AUDIO_READ_TIMEOUT", 600)
         last_error: Exception | None = None
         for attempt in range(1, 4):
             try:
-                response = requests.get(candidate.audio_url, timeout=300, allow_redirects=True)
-                break
+                with requests.get(
+                    candidate.audio_url,
+                    timeout=(connect_timeout, read_timeout),
+                    allow_redirects=True,
+                    stream=True,
+                ) as response:
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "")
+                    suffix = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".mp3"
+                    if suffix not in {".mp3", ".mpeg", ".wav", ".m4a", ".ogg", ".oga", ".webm"}:
+                        suffix = ".mp3"
+                    path = path.with_suffix(suffix)
+                    total_bytes = 0
+                    with path.open("wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                total_bytes += len(chunk)
+                                logger.trace("Downloaded {} bytes...", total_bytes)
+                    logger.info(
+                        "Audio download completed: status={} bytes={} path={}",
+                        response.status_code,
+                        total_bytes,
+                        path,
+                    )
+                    return path
             except requests.RequestException as exc:
                 last_error = exc
                 logger.warning("Audio download failed attempt {}/3: {}", attempt, exc)
+                if path.exists():
+                    path.unlink()
                 if attempt < 3:
-                    time.sleep(2 * attempt)
-        else:
-            raise last_error or RuntimeError(f"Failed to download audio: {candidate.audio_url}")
-        logger.info(
-            "Audio download response: status={} content_type={} bytes={}",
-            response.status_code,
-            response.headers.get("content-type"),
-            len(response.content),
-        )
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        suffix = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".mp3"
-        if suffix not in {".mp3", ".mpeg", ".wav", ".m4a", ".ogg", ".oga", ".webm"}:
-            suffix = ".mp3"
-        path = path.with_suffix(suffix)
-        path.write_bytes(response.content)
-        logger.info("Audio saved: {}", path)
-        return path
+                    time.sleep(5 * attempt)
+        raise last_error or RuntimeError(f"Failed to download audio: {candidate.audio_url}")
 
 
 class AIClient:
