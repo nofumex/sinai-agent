@@ -6,6 +6,7 @@ Telegram admin bot for read-only amoCRM call analysis.
 
 - Reads amoCRM only with `GET` requests.
 - Looks at the sales pipeline and the legal department pipeline.
+- For the selected day, loads leads created that day and leads updated that day in each target pipeline.
 - Uses all stages in selected pipelines.
 - Uses only these managers:
   - Павел
@@ -13,6 +14,7 @@ Telegram admin bot for read-only amoCRM call analysis.
   - Дегтярева Юлия
   - Юлия Миллер
 - Takes calls with recording links and duration from 5 minutes.
+- Analyzes only the first long recorded call in a lead; later long calls in the same lead are skipped.
 - Transcribes audio through OpenAI.
 - Analyzes transcript through OpenAI.
 - Sends the report to the Telegram admin.
@@ -51,12 +53,11 @@ Optional env vars:
 - `FREELLM_ANALYSIS_MODEL`, default falls back to `FREELLM_MODEL`, `LLM_MODEL`, then `llama-3.3-70b-versatile`
 - `CALL_MIN_DURATION_SECONDS`, default `300`
 - `MONITOR_INTERVAL_SECONDS`, default `300`
+- `MONITOR_LOOKBACK_MINUTES`, default `20`
 - `AMOCRM_SALES_PIPELINE_ID`, default `867829`
 - `AMOCRM_LEGAL_PIPELINE_ID`, default `1312204`
 - `AMOCRM_PIPELINE_IDS`, optional comma-separated override for target pipelines
-- `AUDIO_PROXY_URL`, optional proxy only for mp3 downloads, supports `http://`, `https://`, `socks5://`
-- `PROXY_URL`, optional global proxy for all HTTP requests, supports `http://`, `https://`, `socks5://`
-- `AUDIO_HTTP_PROXY`, `AUDIO_HTTPS_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, optional split proxy settings
+- `GROQ_PROXY_URL`, optional proxy only for Groq requests, supports `http://`, `https://`, `socks5://`
 
 ## AI Modes
 
@@ -80,6 +81,10 @@ Use `/start` in Telegram:
 - `База анализов`
 - `Тестовый режим`
 - `Платный режим`
+
+Commands:
+
+- `/reset_db` clears the local processed-calls database so calls can be checked again.
 
 ## Logs
 

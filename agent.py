@@ -72,25 +72,11 @@ def first_env(*names: str) -> str:
     return ""
 
 
-def proxy_config(prefix: str = "") -> dict[str, str] | None:
-    prefix = prefix.strip().upper()
-    scoped = f"{prefix}_" if prefix else ""
-    all_proxy = first_env(f"{scoped}PROXY_URL", "PROXY_URL", "ALL_PROXY", "all_proxy")
-    http_proxy = first_env(f"{scoped}HTTP_PROXY", "HTTP_PROXY", "http_proxy", f"{scoped}PROXY_URL", "PROXY_URL")
-    https_proxy = first_env(f"{scoped}HTTPS_PROXY", "HTTPS_PROXY", "https_proxy", f"{scoped}PROXY_URL", "PROXY_URL")
-    if all_proxy:
-        http_proxy = http_proxy or all_proxy
-        https_proxy = https_proxy or all_proxy
-    proxies = {key: value for key, value in {"http": http_proxy, "https": https_proxy}.items() if value}
-    return proxies or None
-
-
 def groq_proxy_config() -> dict[str, str] | None:
-    """Get proxy configuration for Groq requests, prioritizing GROQ_PROXY_URL."""
-    groq_proxy_url = ENV.get("GROQ_PROXY_URL", "").strip()
-    if groq_proxy_url:
-        return {"http": groq_proxy_url, "https": groq_proxy_url}
-    return proxy_config()
+    proxy_url = first_env("GROQ_PROXY_URL")
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
 
 
 def proxy_label(proxies: dict[str, str] | None) -> str:
@@ -166,6 +152,12 @@ def combined_range(days: list[str]) -> tuple[int, int, str]:
     return min(r[0] for r in ranges), max(r[1] for r in ranges), "+".join(r[2] for r in ranges)
 
 
+def recent_range(minutes: int) -> tuple[int, int, str]:
+    end = kras_now()
+    start = end - timedelta(minutes=minutes)
+    return int(start.timestamp()), int(end.timestamp()), f"последние {minutes} мин"
+
+
 def safe_name(value: str) -> str:
     value = re.sub(r'[<>:"/\\|?*\s]+', "_", value.strip())
     return value.strip("._") or "item"
@@ -203,6 +195,7 @@ class Store:
                     transcript_path text,
                     analysis_path text,
                     is_substantive integer,
+                    source text,
                     status text not null,
                     error text,
                     created_at integer not null
@@ -221,6 +214,7 @@ class Store:
                 "lead_name": "text",
                 "lead_url": "text",
                 "pipeline_status": "text",
+                "source": "text",
             }.items():
                 if column not in existing_columns:
                     conn.execute(f"alter table calls add column {column} {definition}")
@@ -236,6 +230,13 @@ class Store:
                 "insert into settings(key, value) values(?, ?) on conflict(key) do update set value = excluded.value",
                 (key, value),
             )
+
+    def reset_calls(self) -> int:
+        with self.lock, self.connect() as conn:
+            row = conn.execute("select count(*) as c from calls").fetchone()
+            count = int(row["c"] if row else 0)
+            conn.execute("delete from calls")
+            return count
 
     def has_processed_call(self, note_id: int) -> bool:
         with self.lock, self.connect() as conn:
@@ -258,6 +259,7 @@ class Store:
         transcript_path: Path | None = None,
         analysis_path: Path | None = None,
         is_substantive: bool | None = None,
+        source: str = "manual",
         error: str | None = None,
     ) -> None:
         with self.lock, self.connect() as conn:
@@ -267,9 +269,9 @@ class Store:
                     note_id, lead_id, lead_name, lead_url, pipeline_status,
                     manager_id, manager_name, call_time, duration, note_type,
                     audio_url, audio_path, transcript_path, analysis_path, is_substantive,
-                    status, error, created_at
+                    source, status, error, created_at
                 )
-                values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(note_id) do update set
                     lead_name = excluded.lead_name,
                     lead_url = excluded.lead_url,
@@ -284,6 +286,7 @@ class Store:
                     transcript_path = excluded.transcript_path,
                     analysis_path = excluded.analysis_path,
                     is_substantive = excluded.is_substantive,
+                    source = excluded.source,
                     status = excluded.status,
                     error = excluded.error
                 """,
@@ -303,6 +306,7 @@ class Store:
                     str(transcript_path) if transcript_path else None,
                     str(analysis_path) if analysis_path else None,
                     None if is_substantive is None else int(is_substantive),
+                    source,
                     status,
                     error,
                     int(time.time()),
@@ -359,6 +363,18 @@ class Store:
             total = conn.execute("select count(*) as c from calls").fetchone()["c"]
             done = conn.execute("select count(*) as c from calls where status = 'done'").fetchone()["c"]
             errors = conn.execute("select count(*) as c from calls where status = 'error'").fetchone()["c"]
+            day_start, day_end, _ = day_range("today")
+            today_done = conn.execute(
+                "select count(*) as c from calls where status = 'done' and call_time >= ? and call_time < ?",
+                (day_start, day_end),
+            ).fetchone()["c"]
+            today_monitor = conn.execute(
+                """
+                select count(*) as c from calls
+                where status = 'done' and source = 'monitor' and call_time >= ? and call_time < ?
+                """,
+                (day_start, day_end),
+            ).fetchone()["c"]
             substantive = conn.execute(
                 "select count(*) as c from calls where is_substantive = 1 and status = 'done'"
             ).fetchone()["c"]
@@ -369,6 +385,8 @@ class Store:
             "total": total,
             "done": done,
             "errors": errors,
+            "today_done": today_done,
+            "today_monitor": today_monitor,
             "substantive": substantive,
             "last": [dict(row) for row in last],
         }
@@ -411,10 +429,8 @@ class AmoClient:
     def __init__(self, base_url: str, token: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
+        self.session.trust_env = False
         self.session.headers.update({"Authorization": f"Bearer {token}"})
-        proxies = proxy_config()
-        if proxies:
-            self.session.proxies.update(proxies)
         self.sales_pipeline_id = env_int("AMOCRM_SALES_PIPELINE_ID", 867829)
         self.legal_pipeline_id = env_int("AMOCRM_LEGAL_PIPELINE_ID", 1312204)
         self.pipeline_ids = self._load_pipeline_ids()
@@ -423,6 +439,7 @@ class AmoClient:
         self._status_names: dict[tuple[int, int], str] = {}
         self._pipeline_status_ids: dict[int, set[int]] = {}
         self._user_names: dict[int, str] = dict(MANAGER_IDS)
+        self.last_search_summary: dict[str, Any] = {}
 
     def _load_pipeline_ids(self) -> list[int]:
         raw = ENV.get("AMOCRM_PIPELINE_IDS", "").strip()
@@ -554,13 +571,10 @@ class AmoClient:
             MANAGER_IDS,
         )
         for target_pipeline_id in self.pipeline_ids:
-            if target_pipeline_id == self.sales_pipeline_id:
-                query_scopes = [("updated_at", start_ts - 86400, end_ts + 86400)]
-            else:
-                query_scopes = [
-                    ("updated_at", start_ts, end_ts),
-                    ("created_at", start_ts, end_ts),
-                ]
+            query_scopes = [
+                ("updated_at", start_ts, end_ts),
+                ("created_at", start_ts, end_ts),
+            ]
             seen_lead_ids: set[int] = set()
             for time_field, from_ts, to_ts in query_scopes:
                 page = 1
@@ -725,6 +739,13 @@ class AmoClient:
         candidates.sort(key=lambda item: (item.lead_id, item.call_time))
         first_per_lead: dict[int, CallCandidate] = {}
         for candidate in candidates:
+            earlier = self.find_earlier_long_call(candidate, min_duration)
+            if earlier:
+                reject(
+                    "not_first_long_call_in_lead_history",
+                    f"lead={candidate.lead_id} note={candidate.note_id} earlier_note={earlier.get('id')} earlier_time={fmt_dt(int(earlier.get('created_at') or 0))}",
+                )
+                continue
             if candidate.lead_id in first_per_lead:
                 reject("not_first_long_call_in_lead", f"lead={candidate.lead_id} note={candidate.note_id}")
                 continue
@@ -737,7 +758,45 @@ class AmoClient:
             len(result),
             reject_counts,
         )
+        self.last_search_summary = {
+            "leads": len(leads),
+            "raw_candidates": len(candidates),
+            "final_candidates": len(result),
+            "rejects": dict(reject_counts),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+        }
         return result
+
+    def find_earlier_long_call(self, candidate: CallCandidate, min_duration: int) -> dict[str, Any] | None:
+        sources: list[tuple[str, int]] = (
+            [(candidate.note_entity_type, candidate.note_entity_id)]
+            if candidate.note_entity_type and candidate.note_entity_id
+            else [("leads", candidate.lead_id)]
+        )
+        seen_notes: set[int] = set()
+        for entity_type, entity_id in sources:
+            for note in self.list_notes(entity_type, entity_id, end_ts=candidate.call_time):
+                note_id = int(note.get("id") or 0)
+                if not note_id or note_id == candidate.note_id or note_id in seen_notes:
+                    continue
+                seen_notes.add(note_id)
+                if str(note.get("note_type") or "") not in {"call_in", "call_out"}:
+                    continue
+                params = note.get("params") or {}
+                duration = int(params.get("duration") or 0)
+                call_time = int(note.get("created_at") or 0)
+                if call_time < candidate.call_time and duration >= min_duration:
+                    logger.debug(
+                        "Earlier long call found: lead={} candidate_note={} earlier_note={} time={} duration={}",
+                        candidate.lead_id,
+                        candidate.note_id,
+                        note_id,
+                        fmt_dt(call_time),
+                        duration,
+                    )
+                    return note
+        return None
 
     def _inspect_note_for_candidate(
         self,
@@ -858,17 +917,16 @@ class AmoClient:
         logger.info("Downloading audio: lead={} note={} url={}", candidate.lead_id, candidate.note_id, candidate.audio_url)
         connect_timeout = env_int("AUDIO_CONNECT_TIMEOUT", 30)
         read_timeout = env_int("AUDIO_READ_TIMEOUT", 600)
-        proxies = proxy_config("AUDIO") or proxy_config()
-        logger.info("Audio proxy: {}", proxy_label(proxies))
         last_error: Exception | None = None
         for attempt in range(1, 4):
             try:
-                with requests.get(
+                session = requests.Session()
+                session.trust_env = False
+                with session.get(
                     candidate.audio_url,
                     timeout=(connect_timeout, read_timeout),
                     allow_redirects=True,
                     stream=True,
-                    proxies=proxies,
                 ) as response:
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "")
@@ -958,13 +1016,15 @@ class AIClient:
         }
         with audio_path.open("rb") as handle:
             files = {"file": (audio_path.name, handle, "audio/mpeg")}
-            response = requests.post(
+            session = requests.Session()
+            session.trust_env = False
+            response = session.post(
                 url,
                 headers={"Authorization": f"Bearer {api_key}"},
                 data=data,
                 files=files,
                 timeout=600,
-                proxies=groq_proxy_config(),
+                proxies=groq_proxy_config() if service_name == "Groq" else None,
             )
         response.raise_for_status()
         payload = response.json()
@@ -1013,21 +1073,24 @@ class AIClient:
                 {"role": "user", "content": prompt},
             ],
         }
-        response = requests.post(
+        session = requests.Session()
+        session.trust_env = False
+        proxies = groq_proxy_config() if provider_name == "groq" else None
+        response = session.post(
             url,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=body,
             timeout=240,
-            proxies=groq_proxy_config(),
+            proxies=proxies,
         )
         if response.status_code == 400 and "response_format" in response.text:
             body.pop("response_format", None)
-            response = requests.post(
+            response = session.post(
                 url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=body,
                 timeout=240,
-                proxies=groq_proxy_config(),
+                proxies=proxies,
             )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
@@ -1133,30 +1196,33 @@ class TelegramBot:
         self.amo = amo
         self.ai = ai
         self.base_url = f"https://api.telegram.org/bot{token}"
+        self.session = requests.Session()
+        self.session.trust_env = False
         self.offset = 0
         self.job_lock = threading.Lock()
         self.monitor_stop = threading.Event()
         self.monitor_thread: threading.Thread | None = None
         self.awaiting_lead_search = False
+        self.monitor_status_message_id: int | None = None
 
     def api(self, method: str, **payload: Any) -> Any:
         payload = {key: value for key, value in payload.items() if value is not None}
-        attempts = 1 if method == "answerCallbackQuery" else 3
+        attempts = int(payload.pop("_attempts", 1 if method == "answerCallbackQuery" else 3))
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                response = requests.post(
+                response = self.session.post(
                     f"{self.base_url}/{method}",
                     json=payload,
                     timeout=60,
-                    proxies=proxy_config(),
                 )
                 if not response.ok:
                     raise RuntimeError(f"Telegram {method} failed: {response.status_code} {response.text}")
                 return response.json().get("result")
             except (requests.RequestException, RuntimeError) as exc:
                 last_error = exc
-                logger.warning("Telegram {} failed attempt {}/{}: {}", method, attempt, attempts, exc)
+                log = logger.debug if method == "answerCallbackQuery" else logger.warning
+                log("Telegram {} failed attempt {}/{}: {}", method, attempt, attempts, exc)
                 if attempt < attempts:
                     time.sleep(2 * attempt)
         raise last_error or RuntimeError(f"Telegram {method} failed")
@@ -1166,10 +1232,11 @@ class TelegramBot:
         text: str,
         reply_markup: dict[str, Any] | None = None,
         parse_mode: str | None = None,
-    ) -> None:
+    ) -> int | None:
         chunks = [text[i : i + 3900] for i in range(0, len(text), 3900)] or [""]
+        last_message_id: int | None = None
         for index, chunk in enumerate(chunks):
-            self.api(
+            result = self.api(
                 "sendMessage",
                 chat_id=self.admin_id,
                 text=chunk,
@@ -1177,6 +1244,47 @@ class TelegramBot:
                 disable_web_page_preview=True,
                 reply_markup=reply_markup if index == len(chunks) - 1 else None,
             )
+            if isinstance(result, dict) and result.get("message_id"):
+                last_message_id = int(result["message_id"])
+        return last_message_id
+
+    def edit_message(
+        self,
+        message_id: int | None,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
+    ) -> bool:
+        if not message_id:
+            return False
+        if len(text) > 3900:
+            return False
+        try:
+            self.api(
+                "editMessageText",
+                _attempts=1,
+                chat_id=self.admin_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+            )
+            return True
+        except Exception as exc:
+            logger.debug("Could not edit Telegram message {}: {}", message_id, exc)
+            return False
+
+    def edit_or_send(
+        self,
+        message_id: int | None,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
+    ) -> int | None:
+        if self.edit_message(message_id, text, reply_markup, parse_mode):
+            return message_id
+        return self.send(text, reply_markup, parse_mode)
 
     def panel_markup(self) -> dict[str, Any]:
         return {
@@ -1268,15 +1376,26 @@ class TelegramBot:
         keyboard.append([{"text": "⌂ Меню", "callback_data": "main:panel"}])
         return {"inline_keyboard": keyboard}
 
+    def monitor_markup(self) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "↻ Обновить", "callback_data": "monitor:status"},
+                    {"text": "⏹ Стоп", "callback_data": "monitor:stop"},
+                ],
+                [{"text": "⌂ Меню", "callback_data": "main:panel"}],
+            ]
+        }
+
     def start(self) -> None:
+        self.drop_pending_updates()
         print("Bot is running. Open Telegram and send /start to the bot.", flush=True)
         while True:
             try:
-                updates = requests.get(
+                updates = self.session.get(
                     f"{self.base_url}/getUpdates",
                     params={"timeout": 45, "offset": self.offset},
                     timeout=60,
-                    proxies=proxy_config(),
                 ).json().get("result", [])
                 for update in updates:
                     self.offset = max(self.offset, int(update["update_id"]) + 1)
@@ -1285,6 +1404,26 @@ class TelegramBot:
                 print(f"Telegram polling error: {exc}", flush=True)
                 logger.warning("Telegram polling error: {}", exc)
                 time.sleep(5)
+
+    def drop_pending_updates(self) -> None:
+        try:
+            skipped = 0
+            while True:
+                updates = self.session.get(
+                    f"{self.base_url}/getUpdates",
+                    params={"timeout": 0, "offset": self.offset, "limit": 100},
+                    timeout=15,
+                ).json().get("result", [])
+                if not updates:
+                    break
+                skipped += len(updates)
+                self.offset = max(int(update["update_id"]) for update in updates) + 1
+                if len(updates) < 100:
+                    break
+            if skipped:
+                logger.info("Skipped pending Telegram updates on startup: {}", skipped)
+        except Exception as exc:
+            logger.warning("Could not skip pending Telegram updates: {}", exc)
 
     def handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") or {}
@@ -1302,11 +1441,14 @@ class TelegramBot:
                 self.api("answerCallbackQuery", callback_query_id=callback["id"])
             except Exception as exc:
                 logger.debug("Ignoring stale callback answer error: {}", exc)
-            self.handle_callback(str(callback.get("data") or ""))
+            self.handle_callback(str(callback.get("data") or ""), callback.get("message") or {})
             return
 
         text = str(message.get("text") or "")
-        if self.awaiting_lead_search:
+        if text.startswith("/reset_db"):
+            self.awaiting_lead_search = False
+            self.reset_db()
+        elif self.awaiting_lead_search:
             self.awaiting_lead_search = False
             self.handle_lead_search_text(text)
         elif text.startswith("/start") or text.startswith("/panel"):
@@ -1320,7 +1462,17 @@ class TelegramBot:
         else:
             self.send("Выбери действие.", self.panel_markup())
 
-    def handle_callback(self, data: str) -> None:
+    def reset_db(self) -> None:
+        deleted = self.store.reset_calls()
+        logger.warning("Local calls database reset by admin: deleted_rows={}", deleted)
+        self.send(
+            f"Локальная база обработанных звонков очищена. Удалено записей: {deleted}.\n"
+            "Файлы audio/transcripts/analysis на диске не удалялись. Теперь можно заново запускать анализ.",
+            self.panel_markup(),
+        )
+
+    def handle_callback(self, data: str, callback_message: dict[str, Any] | None = None) -> None:
+        callback_message_id = int((callback_message or {}).get("message_id") or 0) or None
         if data == "main:panel":
             self.awaiting_lead_search = False
             self.send("Панель анализа звонков. amoCRM только читается.", self.panel_markup())
@@ -1351,9 +1503,13 @@ class TelegramBot:
         elif data == "candidates:both":
             self.start_job("Проверка кандидатов", lambda: self.preview_candidates(["yesterday", "today"]))
         elif data == "monitor:start":
-            self.start_monitor()
+            self.start_monitor(callback_message_id)
         elif data == "monitor:stop":
-            self.stop_monitor()
+            self.stop_monitor(callback_message_id)
+        elif data == "monitor:status":
+            shown_id = self.edit_or_send(callback_message_id, self.render_monitor_status(), self.monitor_markup(), parse_mode="HTML")
+            if shown_id:
+                self.monitor_status_message_id = shown_id
         elif data == "stats":
             self.send(self.render_stats(), self.panel_markup())
         elif data == "status":
@@ -1477,7 +1633,17 @@ class TelegramBot:
 
     def run_analysis(self, days: list[str], silent_no_candidates: bool = False) -> None:
         start_ts, end_ts, label = combined_range(days)
-        logger.info("Telegram action: run analysis for {} ({})", days, label)
+        self.run_analysis_range(start_ts, end_ts, label, silent_no_candidates, source="manual")
+
+    def run_analysis_range(
+        self,
+        start_ts: int,
+        end_ts: int,
+        label: str,
+        silent_no_candidates: bool = False,
+        source: str = "manual",
+    ) -> None:
+        logger.info("Telegram action: run analysis window {}..{} ({})", fmt_dt(start_ts), fmt_dt(end_ts), label)
         candidates = self.amo.find_call_candidates(start_ts, end_ts, self.store)
         if not candidates:
             if not silent_no_candidates:
@@ -1488,11 +1654,11 @@ class TelegramBot:
         processed: list[tuple[CallCandidate, dict[str, Any]]] = []
         for candidate in candidates:
             try:
-                analysis = self.process_candidate(candidate)
+                analysis = self.process_candidate(candidate, source=source)
                 processed.append((candidate, analysis))
                 done += 1
             except Exception as exc:
-                self.store.save_call(candidate, status="error", error=str(exc)[:2000])
+                self.store.save_call(candidate, status="error", source=source, error=str(exc)[:2000])
                 self.send(f"Ошибка по звонку {candidate.note_id}: {exc}")
         if processed:
             self.send(
@@ -1503,7 +1669,7 @@ class TelegramBot:
         else:
             self.send(f"Готово за {label}. Обработано: {done}/{len(candidates)}.", self.panel_markup())
 
-    def process_candidate(self, candidate: CallCandidate) -> dict[str, Any]:
+    def process_candidate(self, candidate: CallCandidate, source: str = "manual") -> dict[str, Any]:
         logger.info(
             "Processing candidate start: lead={} note={} manager={} duration={} url={}",
             candidate.lead_id,
@@ -1512,7 +1678,7 @@ class TelegramBot:
             candidate.duration,
             candidate.lead_url,
         )
-        self.store.save_call(candidate, status="processing")
+        self.store.save_call(candidate, status="processing", source=source)
         audio_path = self.amo.download_audio(candidate)
         transcript = self.ai.transcribe(audio_path)
         transcript_path = save_transcript(candidate, transcript)
@@ -1526,6 +1692,7 @@ class TelegramBot:
             transcript_path=transcript_path,
             analysis_path=analysis_path,
             is_substantive=is_substantive,
+            source=source,
         )
         logger.info(
             "Processing candidate done: lead={} note={} substantive={} transcript={} analysis={}",
@@ -1537,30 +1704,81 @@ class TelegramBot:
         )
         return analysis
 
-    def start_monitor(self) -> None:
+    def start_monitor(self, message_id: int | None = None) -> None:
         if self.monitor_thread and self.monitor_thread.is_alive():
-            self.send("Мониторинг уже включен.", self.panel_markup())
+            shown_id = self.edit_or_send(message_id, self.render_monitor_status(), self.monitor_markup(), parse_mode="HTML")
+            if shown_id:
+                self.monitor_status_message_id = shown_id
             return
         self.monitor_stop.clear()
         self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
         self.monitor_thread.start()
         self.store.set_setting("monitor_started_at", str(int(time.time())))
-        self.send("Мониторинг включен. Буду проверять новые подходящие звонки.", self.panel_markup())
+        shown_id = self.edit_or_send(message_id, self.render_monitor_status(), self.monitor_markup(), parse_mode="HTML")
+        if shown_id:
+            self.monitor_status_message_id = shown_id
+        return
+        self.send("Мониторинг включен. Буду проверять новые подходящие звонки.", self.monitor_markup())
 
-    def stop_monitor(self) -> None:
+    def stop_monitor(self, message_id: int | None = None) -> None:
         self.monitor_stop.set()
+        self.monitor_status_message_id = None
+        self.edit_or_send(message_id, "Мониторинг остановлен.", self.panel_markup())
+        return
         self.send("Мониторинг остановлен.", self.panel_markup())
 
     def monitor_loop(self) -> None:
         interval = env_int("MONITOR_INTERVAL_SECONDS", 300)
+        lookback_minutes = env_int("MONITOR_LOOKBACK_MINUTES", 20)
         while not self.monitor_stop.is_set():
             if not self.job_lock.locked():
                 with self.job_lock:
                     try:
-                        self.run_analysis(["yesterday", "today"], silent_no_candidates=True)
+                        start_ts, end_ts, label = recent_range(lookback_minutes)
+                        logger.info(
+                            "Monitor cycle: window={}..{} label={}",
+                            fmt_dt(start_ts),
+                            fmt_dt(end_ts),
+                            label,
+                        )
+                        before_done = self.store.stats()["done"]
+                        self.run_analysis_range(
+                            start_ts,
+                            end_ts,
+                            label,
+                            silent_no_candidates=True,
+                            source="monitor",
+                        )
+                        after_done = self.store.stats()["done"]
+                        self.save_monitor_summary(
+                            start_ts=start_ts,
+                            end_ts=end_ts,
+                            processed=max(0, int(after_done) - int(before_done)),
+                        )
+                        self.refresh_monitor_status_screen()
                     except Exception as exc:
                         self.send(f"Ошибка мониторинга: {exc}", self.panel_markup())
             self.monitor_stop.wait(interval)
+
+    def save_monitor_summary(self, start_ts: int, end_ts: int, processed: int) -> None:
+        summary = dict(self.amo.last_search_summary or {})
+        summary.update(
+            {
+                "checked_at": int(time.time()),
+                "window_start": start_ts,
+                "window_end": end_ts,
+                "processed": processed,
+            }
+        )
+        self.store.set_setting("monitor_last_summary", json.dumps(summary, ensure_ascii=False))
+
+    def refresh_monitor_status_screen(self) -> None:
+        message_id = self.monitor_status_message_id
+        if not message_id:
+            return
+        ok = self.edit_message(message_id, self.render_monitor_status(), self.monitor_markup(), parse_mode="HTML")
+        if not ok:
+            self.monitor_status_message_id = None
 
     def render_stats(self) -> str:
         stats = self.store.stats()
@@ -1568,6 +1786,8 @@ class TelegramBot:
             "Статистика",
             f"Всего в базе: {stats['total']}",
             f"Готово: {stats['done']}",
+            f"Сегодня проанализировано: {stats['today_done']}",
+            f"Сегодня через мониторинг: {stats['today_monitor']}",
             f"Содержательных: {stats['substantive']}",
             f"Ошибок: {stats['errors']}",
         ]
@@ -1581,6 +1801,62 @@ class TelegramBot:
                 )
         return "\n".join(lines)
 
+    def render_monitor_status(self) -> str:
+        active = bool(self.monitor_thread and self.monitor_thread.is_alive())
+        stats = self.store.stats()
+        raw = self.store.get_setting("monitor_last_summary", "")
+        summary: dict[str, Any] = {}
+        if raw:
+            try:
+                summary = json.loads(raw)
+            except json.JSONDecodeError:
+                summary = {}
+
+        lines = [
+            "📡 <b>Мониторинг</b>",
+            f"Статус: <b>{'включен' if active else 'выключен'}</b>",
+            f"Интервал: каждые <b>{env_int('MONITOR_INTERVAL_SECONDS', 300)}</b> сек",
+            f"Окно проверки: последние <b>{env_int('MONITOR_LOOKBACK_MINUTES', 20)}</b> мин",
+            "",
+            f"Сегодня всего анализов: <b>{stats['today_done']}</b>",
+            f"Сегодня через мониторинг: <b>{stats['today_monitor']}</b>",
+        ]
+        if not summary:
+            lines.extend(["", "Последнего чека еще не было."])
+            return "\n".join(lines)
+
+        checked_at = int(summary.get("checked_at") or 0)
+        window_start = int(summary.get("window_start") or summary.get("start_ts") or 0)
+        window_end = int(summary.get("window_end") or summary.get("end_ts") or 0)
+        final_candidates = int(summary.get("final_candidates") or 0)
+        processed = int(summary.get("processed") or 0)
+        rejects = summary.get("rejects") if isinstance(summary.get("rejects"), dict) else {}
+
+        lines.extend(
+            [
+                "",
+                "<b>Последний чек</b>",
+                f"Время: <b>{h(fmt_dt_seconds(checked_at))}</b>" if checked_at else "Время: нет данных",
+                (
+                    f"Период: {h(fmt_dt_seconds(window_start))} - {h(fmt_dt_seconds(window_end))}"
+                    if window_start and window_end
+                    else "Период: нет данных"
+                ),
+                f"Сделок проверено: <b>{int(summary.get('leads') or 0)}</b>",
+                f"Подходящих звонков до финального отбора: <b>{int(summary.get('raw_candidates') or 0)}</b>",
+                f"Прошло в анализ: <b>{final_candidates}</b>",
+                f"Обработано в этом чеке: <b>{processed}</b>",
+            ]
+        )
+        if final_candidates == 0:
+            lines.append("")
+            lines.append("<b>Почему ничего не прошло</b>")
+            lines.extend(render_reject_reasons(rejects))
+        elif processed == 0:
+            lines.append("")
+            lines.append("Подходящие звонки были найдены, но новых обработанных отчетов в этом чеке не появилось.")
+        return "\n".join(lines)
+
     def render_status(self) -> str:
         active = bool(self.monitor_thread and self.monitor_thread.is_alive())
         provider = self.ai.provider_summary()
@@ -1590,8 +1866,10 @@ class TelegramBot:
                 f"Мониторинг: {'включен' if active else 'выключен'}",
                 f"Режим: {provider['mode']}",
                 f"Минимальная длительность: {env_int('CALL_MIN_DURATION_SECONDS', 300)} сек",
+                f"Окно мониторинга: последние {env_int('MONITOR_LOOKBACK_MINUTES', 20)} мин",
                 f"Воронки: Отдел продаж ({env_int('AMOCRM_SALES_PIPELINE_ID', 867829)}) + Юридический отдел ({env_int('AMOCRM_LEGAL_PIPELINE_ID', 1312204)})",
                 "Этапы: все этапы выбранных воронок",
+                f"Прокси Groq: {proxy_label(groq_proxy_config())}",
                 f"Транскрибация: {provider['transcriber']}",
                 f"Анализ: {provider['analyzer']}",
             ]
@@ -1600,6 +1878,10 @@ class TelegramBot:
 
 def fmt_dt(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M")
+
+
+def fmt_dt_seconds(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def fmt_duration(seconds: int) -> str:
@@ -1697,6 +1979,27 @@ def render_archive_rows(title: str, rows: list[dict[str, Any]]) -> str:
         lines.append(f"Показаны первые 30 из {len(rows)}.")
     lines.append("Открой нужный отчет кнопкой ниже.")
     return fit_html_lines(lines)
+
+
+def render_reject_reasons(rejects: dict[str, Any]) -> list[str]:
+    if not rejects:
+        return ["Причин отказа нет: в проверенных сделках не было звонков-кандидатов."]
+    labels = {
+        "outside_date_range": "звонок был вне свежего окна проверки",
+        "not_call_note": "событие было не звонком",
+        "too_short": "звонок короче минимальной длительности",
+        "no_recording_link": "у звонка не было ссылки на запись",
+        "wrong_manager": "звонок не относится к нужным менеджерам",
+        "already_processed": "звонок уже был обработан раньше",
+        "duplicate_note": "дубль одной и той же заметки",
+        "not_first_long_call_in_lead": "в этой сделке уже найден более ранний длинный звонок в окне",
+        "not_first_long_call_in_lead_history": "в этой сделке раньше уже был длинный звонок",
+    }
+    lines = []
+    for reason, count in sorted(rejects.items(), key=lambda item: str(item[0])):
+        label = labels.get(str(reason), str(reason))
+        lines.append(f"• {h(label)}: <b>{int(count)}</b>")
+    return lines
 
 
 def render_field(title: str, value: Any, emoji: str = "•") -> str:
