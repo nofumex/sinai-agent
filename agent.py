@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from loguru import logger
@@ -61,6 +62,41 @@ def load_env() -> dict[str, str]:
 
 
 ENV = load_env()
+
+
+def first_env(*names: str) -> str:
+    for name in names:
+        value = ENV.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def proxy_config(prefix: str = "") -> dict[str, str] | None:
+    prefix = prefix.strip().upper()
+    scoped = f"{prefix}_" if prefix else ""
+    all_proxy = first_env(f"{scoped}PROXY_URL", "PROXY_URL", "ALL_PROXY", "all_proxy")
+    http_proxy = first_env(f"{scoped}HTTP_PROXY", "HTTP_PROXY", "http_proxy", f"{scoped}PROXY_URL", "PROXY_URL")
+    https_proxy = first_env(f"{scoped}HTTPS_PROXY", "HTTPS_PROXY", "https_proxy", f"{scoped}PROXY_URL", "PROXY_URL")
+    if all_proxy:
+        http_proxy = http_proxy or all_proxy
+        https_proxy = https_proxy or all_proxy
+    proxies = {key: value for key, value in {"http": http_proxy, "https": https_proxy}.items() if value}
+    return proxies or None
+
+
+def proxy_label(proxies: dict[str, str] | None) -> str:
+    if not proxies:
+        return "off"
+    labels = []
+    for scheme, url in proxies.items():
+        parsed = urlsplit(url)
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        safe_url = urlunsplit((parsed.scheme, netloc, "", "", ""))
+        labels.append(f"{scheme}={safe_url}")
+    return ", ".join(labels)
 
 
 def setup_logging() -> None:
@@ -368,6 +404,9 @@ class AmoClient:
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"Bearer {token}"})
+        proxies = proxy_config()
+        if proxies:
+            self.session.proxies.update(proxies)
         self.sales_pipeline_id = env_int("AMOCRM_SALES_PIPELINE_ID", 867829)
         self.legal_pipeline_id = env_int("AMOCRM_LEGAL_PIPELINE_ID", 1312204)
         self.pipeline_ids = self._load_pipeline_ids()
@@ -811,6 +850,8 @@ class AmoClient:
         logger.info("Downloading audio: lead={} note={} url={}", candidate.lead_id, candidate.note_id, candidate.audio_url)
         connect_timeout = env_int("AUDIO_CONNECT_TIMEOUT", 30)
         read_timeout = env_int("AUDIO_READ_TIMEOUT", 600)
+        proxies = proxy_config("AUDIO") or proxy_config()
+        logger.info("Audio proxy: {}", proxy_label(proxies))
         last_error: Exception | None = None
         for attempt in range(1, 4):
             try:
@@ -819,6 +860,7 @@ class AmoClient:
                     timeout=(connect_timeout, read_timeout),
                     allow_redirects=True,
                     stream=True,
+                    proxies=proxies,
                 ) as response:
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "")
@@ -914,6 +956,7 @@ class AIClient:
                 data=data,
                 files=files,
                 timeout=600,
+                proxies=proxy_config(),
             )
         response.raise_for_status()
         payload = response.json()
@@ -967,6 +1010,7 @@ class AIClient:
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=body,
             timeout=240,
+            proxies=proxy_config(),
         )
         if response.status_code == 400 and "response_format" in response.text:
             body.pop("response_format", None)
@@ -975,7 +1019,8 @@ class AIClient:
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=body,
                 timeout=240,
-        )
+                proxies=proxy_config(),
+            )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
         try:
@@ -1092,7 +1137,12 @@ class TelegramBot:
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                response = requests.post(f"{self.base_url}/{method}", json=payload, timeout=60)
+                response = requests.post(
+                    f"{self.base_url}/{method}",
+                    json=payload,
+                    timeout=60,
+                    proxies=proxy_config(),
+                )
                 if not response.ok:
                     raise RuntimeError(f"Telegram {method} failed: {response.status_code} {response.text}")
                 return response.json().get("result")
@@ -1218,6 +1268,7 @@ class TelegramBot:
                     f"{self.base_url}/getUpdates",
                     params={"timeout": 45, "offset": self.offset},
                     timeout=60,
+                    proxies=proxy_config(),
                 ).json().get("result", [])
                 for update in updates:
                     self.offset = max(self.offset, int(update["update_id"]) + 1)

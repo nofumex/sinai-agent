@@ -54,6 +54,9 @@ Optional env vars:
 - `AMOCRM_SALES_PIPELINE_ID`, default `867829`
 - `AMOCRM_LEGAL_PIPELINE_ID`, default `1312204`
 - `AMOCRM_PIPELINE_IDS`, optional comma-separated override for target pipelines
+- `AUDIO_PROXY_URL`, optional proxy only for mp3 downloads, supports `http://`, `https://`, `socks5://`
+- `PROXY_URL`, optional global proxy for all HTTP requests, supports `http://`, `https://`, `socks5://`
+- `AUDIO_HTTP_PROXY`, `AUDIO_HTTPS_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, optional split proxy settings
 
 ## AI Modes
 
