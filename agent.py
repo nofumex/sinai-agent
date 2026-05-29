@@ -85,6 +85,14 @@ def proxy_config(prefix: str = "") -> dict[str, str] | None:
     return proxies or None
 
 
+def groq_proxy_config() -> dict[str, str] | None:
+    """Get proxy configuration for Groq requests, prioritizing GROQ_PROXY_URL."""
+    groq_proxy_url = ENV.get("GROQ_PROXY_URL", "").strip()
+    if groq_proxy_url:
+        return {"http": groq_proxy_url, "https": groq_proxy_url}
+    return proxy_config()
+
+
 def proxy_label(proxies: dict[str, str] | None) -> str:
     if not proxies:
         return "off"
@@ -956,7 +964,7 @@ class AIClient:
                 data=data,
                 files=files,
                 timeout=600,
-                proxies=proxy_config(),
+                proxies=groq_proxy_config(),
             )
         response.raise_for_status()
         payload = response.json()
@@ -1010,7 +1018,7 @@ class AIClient:
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=body,
             timeout=240,
-            proxies=proxy_config(),
+            proxies=groq_proxy_config(),
         )
         if response.status_code == 400 and "response_format" in response.text:
             body.pop("response_format", None)
@@ -1019,7 +1027,7 @@ class AIClient:
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=body,
                 timeout=240,
-                proxies=proxy_config(),
+                proxies=groq_proxy_config(),
             )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
