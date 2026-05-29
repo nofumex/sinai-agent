@@ -58,6 +58,8 @@ Optional env vars:
 - `AMOCRM_LEGAL_PIPELINE_ID`, default `1312204`
 - `AMOCRM_PIPELINE_IDS`, optional comma-separated override for target pipelines
 - `GROQ_PROXY_URL`, optional proxy only for Groq requests, supports `http://`, `https://`, `socks5://`
+- `TELEGRAM_API_IP`, optional IPv4 override only for `api.telegram.org`, for example `149.154.167.220`
+- `TELEGRAM_FORCE_IPV4`, optional `1/true/yes/on` to force IPv4 only for `api.telegram.org`
 
 ## AI Modes
 

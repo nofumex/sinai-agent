@@ -5,6 +5,7 @@ import html
 import mimetypes
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -77,6 +78,38 @@ def groq_proxy_config() -> dict[str, str] | None:
     if not proxy_url:
         return None
     return {"http": proxy_url, "https": proxy_url}
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = ENV.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def install_telegram_dns_override() -> None:
+    api_ip = first_env("TELEGRAM_API_IP")
+    force_ipv4 = env_bool("TELEGRAM_FORCE_IPV4")
+    if not api_ip and not force_ipv4:
+        return
+    if getattr(socket, "_sinai_telegram_dns_override", False):
+        return
+
+    original_getaddrinfo = socket.getaddrinfo
+
+    def patched_getaddrinfo(host: str, port: int, family: int = 0, type: int = 0, proto: int = 0, flags: int = 0):
+        if host == "api.telegram.org":
+            target_host = api_ip or host
+            target_family = socket.AF_INET if api_ip or force_ipv4 else family
+            return original_getaddrinfo(target_host, port, target_family, type, proto, flags)
+        return original_getaddrinfo(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = patched_getaddrinfo
+    setattr(socket, "_sinai_telegram_dns_override", True)
+    if api_ip:
+        logger.info("Telegram DNS override enabled: api.telegram.org -> {}", api_ip)
+    else:
+        logger.info("Telegram IPv4-only DNS mode enabled")
 
 
 def proxy_label(proxies: dict[str, str] | None) -> str:
@@ -1190,6 +1223,7 @@ def build_analysis_prompt(candidate: CallCandidate, transcript: str) -> str:
 
 class TelegramBot:
     def __init__(self, token: str, admin_id: int, store: Store, amo: AmoClient, ai: AIClient) -> None:
+        install_telegram_dns_override()
         self.token = token
         self.admin_id = admin_id
         self.store = store
