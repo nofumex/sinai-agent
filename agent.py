@@ -809,7 +809,18 @@ class AmoClient:
 
         # Use a clean request here so the amoCRM Authorization header is never sent to telephony hosts.
         logger.info("Downloading audio: lead={} note={} url={}", candidate.lead_id, candidate.note_id, candidate.audio_url)
-        response = requests.get(candidate.audio_url, timeout=180, allow_redirects=True)
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = requests.get(candidate.audio_url, timeout=300, allow_redirects=True)
+                break
+            except requests.RequestException as exc:
+                last_error = exc
+                logger.warning("Audio download failed attempt {}/3: {}", attempt, exc)
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+        else:
+            raise last_error or RuntimeError(f"Failed to download audio: {candidate.audio_url}")
         logger.info(
             "Audio download response: status={} content_type={} bytes={}",
             response.status_code,
