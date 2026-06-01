@@ -156,6 +156,21 @@ def env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def min_transcript_chars_for_duration(duration_seconds: int) -> int:
+    if duration_seconds < env_int("CALL_MIN_DURATION_SECONDS", 300):
+        return 0
+    chars_per_minute = env_int("MIN_TRANSCRIPT_CHARS_PER_MINUTE", 90)
+    absolute_min = env_int("MIN_TRANSCRIPT_CHARS", 350)
+    return max(absolute_min, int((duration_seconds / 60) * chars_per_minute))
+
+
+def is_transcript_suspiciously_short(duration_seconds: int, transcript: str) -> bool:
+    minimum = min_transcript_chars_for_duration(duration_seconds)
+    if not minimum:
+        return False
+    return len(transcript.strip()) < minimum
+
+
 def require_env(name: str) -> str:
     value = ENV.get(name, "").strip()
     if not value:
@@ -997,6 +1012,7 @@ class AIClient:
         self.openai_transcribe_model = ENV.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
         self.openai_analysis_model = ENV.get("OPENAI_ANALYSIS_MODEL", "gpt-4o-mini")
         self.groq_transcribe_model = ENV.get("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
+        self.groq_transcribe_fallback_model = ENV.get("GROQ_TRANSCRIBE_FALLBACK_MODEL", "whisper-large-v3")
         self.groq_analysis_model = ENV.get(
             "GROQ_ANALYSIS_MODEL",
             ENV.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
@@ -1024,16 +1040,16 @@ class AIClient:
             analyzer = f"groq/{self.groq_analysis_model} -> freellm/{self.freellm_analysis_model}"
         return {"mode": mode, "transcriber": transcriber, "analyzer": analyzer}
 
-    def transcribe(self, audio_path: Path) -> str:
+    def transcribe(self, audio_path: Path, model_override: str | None = None) -> str:
         if self.mode() == "paid":
             api_key = require_env("OPENAI_API_KEY")
             url = "https://api.openai.com/v1/audio/transcriptions"
-            model = self.openai_transcribe_model
+            model = model_override or self.openai_transcribe_model
             service_name = "OpenAI"
         else:
             api_key = require_env("GROQ_API_KEY")
             url = "https://api.groq.com/openai/v1/audio/transcriptions"
-            model = self.groq_transcribe_model
+            model = model_override or self.groq_transcribe_model
             service_name = "Groq"
 
         logger.info("Transcribing audio via {} model={} file={}", service_name, model, audio_path)
@@ -1066,6 +1082,36 @@ class AIClient:
             raise RuntimeError(f"{service_name} returned empty transcription")
         logger.info("Transcription completed via {}: chars={}", service_name, len(text))
         return text
+
+    def transcribe_for_call(self, audio_path: Path, duration_seconds: int) -> str:
+        transcript = self.transcribe(audio_path)
+        if not is_transcript_suspiciously_short(duration_seconds, transcript):
+            return transcript
+
+        minimum = min_transcript_chars_for_duration(duration_seconds)
+        logger.warning(
+            "Suspiciously short transcript: duration={} chars={} minimum={}",
+            duration_seconds,
+            len(transcript),
+            minimum,
+        )
+
+        if self.mode() == "test" and self.groq_transcribe_fallback_model != self.groq_transcribe_model:
+            retry = self.transcribe(audio_path, model_override=self.groq_transcribe_fallback_model)
+            if len(retry.strip()) > len(transcript.strip()):
+                transcript = retry
+            logger.info(
+                "Fallback transcription result: model={} chars={}",
+                self.groq_transcribe_fallback_model,
+                len(transcript),
+            )
+
+        if is_transcript_suspiciously_short(duration_seconds, transcript):
+            raise RuntimeError(
+                "Transcription looks incomplete: "
+                f"duration={fmt_duration(duration_seconds)}, chars={len(transcript)}, expected_at_least={minimum}"
+            )
+        return transcript
 
     def analyze(self, candidate: CallCandidate, transcript: str) -> dict[str, Any]:
         configs = self._chat_configs()
@@ -1714,7 +1760,7 @@ class TelegramBot:
         )
         self.store.save_call(candidate, status="processing", source=source)
         audio_path = self.amo.download_audio(candidate)
-        transcript = self.ai.transcribe(audio_path)
+        transcript = self.ai.transcribe_for_call(audio_path, candidate.duration)
         transcript_path = save_transcript(candidate, transcript)
         analysis = self.ai.analyze(candidate, transcript)
         analysis_path = save_analysis(candidate, analysis)

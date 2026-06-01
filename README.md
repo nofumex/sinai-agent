@@ -48,10 +48,13 @@ Optional env vars:
 - `OPENAI_TRANSCRIBE_MODEL`, default `gpt-4o-mini-transcribe`
 - `OPENAI_ANALYSIS_MODEL`, default `gpt-4o-mini`
 - `GROQ_TRANSCRIBE_MODEL`, default `whisper-large-v3-turbo`
+- `GROQ_TRANSCRIBE_FALLBACK_MODEL`, default `whisper-large-v3`
 - `GROQ_ANALYSIS_MODEL`, default `llama-3.3-70b-versatile`
 - `FREELLM_BASE_URL`, default `http://155.212.217.115:3001/v1`
 - `FREELLM_ANALYSIS_MODEL`, default falls back to `FREELLM_MODEL`, `LLM_MODEL`, then `llama-3.3-70b-versatile`
 - `CALL_MIN_DURATION_SECONDS`, default `300`
+- `MIN_TRANSCRIPT_CHARS_PER_MINUTE`, default `90`
+- `MIN_TRANSCRIPT_CHARS`, default `350`
 - `MONITOR_INTERVAL_SECONDS`, default `300`
 - `MONITOR_LOOKBACK_MINUTES`, default `20`
 - `AMOCRM_SALES_PIPELINE_ID`, default `867829`
