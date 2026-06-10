@@ -211,6 +211,15 @@ def safe_name(value: str) -> str:
     return value.strip("._") or "item"
 
 
+def is_mp3_recording_url(url: str) -> bool:
+    path = urlsplit(url).path.lower().rstrip("/")
+    return path.endswith(".mp3")
+
+
+def is_mp3_audio_path(path: Path) -> bool:
+    return path.suffix.lower() == ".mp3"
+
+
 class Store:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -833,7 +842,10 @@ class AmoClient:
                     continue
                 params = note.get("params") or {}
                 duration = int(params.get("duration") or 0)
+                link = str(params.get("link") or "").strip()
                 call_time = int(note.get("created_at") or 0)
+                if not is_mp3_recording_url(link):
+                    continue
                 if call_time < candidate.call_time and duration >= min_duration:
                     logger.debug(
                         "Earlier long call found: lead={} candidate_note={} earlier_note={} time={} duration={}",
@@ -912,6 +924,12 @@ class AmoClient:
                     reject(
                         "no_recording_link",
                         f"lead={lead.lead_id} note={note.get('id')} source={entity_type}/{entity_id} duration={duration}",
+                    )
+                    return
+                if not is_mp3_recording_url(link):
+                    reject(
+                        "unsupported_recording_format",
+                        f"lead={lead.lead_id} note={note.get('id')} source={entity_type}/{entity_id} link={link}",
                     )
                     return
                 if store.has_processed_call(int(note["id"])):
@@ -1765,6 +1783,8 @@ class TelegramBot:
         )
         self.store.save_call(candidate, status="processing", source=source)
         audio_path = self.amo.download_audio(candidate)
+        if not is_mp3_audio_path(audio_path):
+            raise RuntimeError(f"Only MP3 recordings are supported for transcription: {audio_path.name}")
         transcript = self.ai.transcribe_for_call(audio_path, candidate.duration)
         transcript_path = save_transcript(candidate, transcript)
         analysis = self.ai.analyze(candidate, transcript)
@@ -2070,6 +2090,7 @@ def render_reject_reasons(rejects: dict[str, Any]) -> list[str]:
     if not rejects:
         return ["Причин отказа нет: в проверенных сделках не было звонков-кандидатов."]
     labels = {
+        "unsupported_recording_format": "формат записи не MP3",
         "outside_date_range": "звонок был вне свежего окна проверки",
         "not_call_note": "событие было не звонком",
         "too_short": "звонок короче минимальной длительности",
