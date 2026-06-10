@@ -1240,26 +1240,31 @@ def build_analysis_prompt(candidate: CallCandidate, transcript: str) -> str:
         "lead_url": candidate.lead_url,
     }
     return (
-        "Проанализируй первый содержательный звонок с новым клиентом.\n"
-        "Сначала определи, был ли звонок содержательным: обсуждалась ли потребность, услуга, цена, договор, "
-        "следующий шаг, запись или решение клиента. Если это технический/короткий/нецелевой разговор, отметь это.\n\n"
+        "Проанализируй качество продажи в звонке менеджера юридической компании.\n"
+        "Не пересказывай юридическую ситуацию клиента и не оценивай менеджера общими фразами. "
+        "Проверяй только конкретные действия менеджера в продаже: выявление ситуации, стоимость, возражения, "
+        "паспортные данные и следующий шаг.\n"
+        "Каждый вывод да/нет/частично подтверждай короткой дословной цитатой из транскрипта. "
+        "Если действия не было, так и пиши без выдуманной цитаты. Не используй слово «Цитата».\n"
+        "Недостающие действия формулируй только как конкретные действия, которые менеджер не сделал в этом звонке.\n\n"
         "Верни строго JSON со структурой:\n"
         "{\n"
         '  "is_substantive": true,\n'
-        '  "confidence": 0.0,\n'
-        '  "summary": "...",\n'
-        '  "price_named": {"value": "да/нет/неясно", "format": "как названа стоимость", "evidence": "короткий фрагмент"},\n'
-        '  "contract_offered": {"value": "да/нет/неясно", "evidence": "короткий фрагмент"},\n'
-        '  "need_discovered": {"value": "да/нет/частично", "comment": "..."},\n'
-        '  "procedure_explained": {"value": "да/нет/частично", "comment": "..."},\n'
-        '  "objections": ["..."],\n'
-        '  "objection_handling": "...",\n'
-        '  "next_step": "...",\n'
-        '  "manager_strengths": ["..."],\n'
-        '  "manager_mistakes": ["..."],\n'
-        '  "recommendations": ["..."],\n'
-        '  "score_10": 0\n'
+        '  "client_situation_discovered": {"value": "да/частично/нет", "quote": "короткая цитата или пустая строка"},\n'
+        '  "price_named": {"value": "да/нет", "quote": "короткая цитата или пустая строка"},\n'
+        '  "objections_clarified": {"value": "да/частично/нет", "quote": "короткая цитата или пустая строка"},\n'
+        '  "objections_closed": {"value": "да/частично/нет", "quote": "короткая цитата или пустая строка"},\n'
+        '  "passport_requested": {"value": "да/нет/не требовалось", "quote": "короткая цитата или пустая строка"},\n'
+        '  "next_step": {"action": "конкретное действие: паспорт/оплата/перезвон/проверка юриста/иное", "quote": "короткая цитата или пустая строка"},\n'
+        '  "missing_actions": ["конкретное действие, которого не хватило"]\n'
         "}\n\n"
+        "Правила:\n"
+        "- is_substantive=false только если звонок технический, случайный, слишком короткий или не относится к продаже.\n"
+        "- client_situation_discovered: менеджер выяснил долги, доход, имущество, семью, просрочки или другую важную вводную.\n"
+        "- objections_clarified: менеджер уточнил сомнение, барьер, вопрос по оплате, срокам, рискам, ипотеке, доходу или документам.\n"
+        "- objections_closed: менеджер ответил на возражение или объяснил, что делать с барьером.\n"
+        "- passport_requested=не требовалось, если менеджер обоснованно не переводил клиента к оформлению.\n"
+        "- missing_actions не заполняй общими советами; только конкретные пропущенные действия.\n\n"
         "Метаданные:\n"
         f"{json.dumps(meta, ensure_ascii=False, indent=2)}\n\n"
         "Транскрипт:\n"
@@ -2111,6 +2116,44 @@ def fit_html_lines(lines: list[str], limit: int = 3800) -> str:
     return "\n".join(fitted)
 
 
+def sales_check_lines(title: str, value: Any) -> list[str]:
+    if isinstance(value, dict):
+        status = str(value.get("value") or value.get("action") or "не указано")
+        quote = str(value.get("quote") or "").strip()
+    else:
+        status = str(value or "не указано")
+        quote = ""
+
+    lines = [f"<b>{h(title)}:</b>", h(clip(status, 320))]
+    if quote:
+        lines.append(f'"{h(clip(quote, 420))}"')
+    return lines
+
+
+def missing_action_lines(items: Any) -> list[str]:
+    lines = ["<b>Недостающие действия:</b>"]
+    if isinstance(items, list) and items:
+        lines.extend(f"- {h(clip(item, 320))}" for item in items)
+    elif items:
+        lines.append(f"- {h(clip(items, 320))}")
+    else:
+        lines.append("- нет")
+    return lines
+
+
+def is_sales_analysis(analysis: dict[str, Any]) -> bool:
+    return any(
+        key in analysis
+        for key in [
+            "client_situation_discovered",
+            "objections_clarified",
+            "objections_closed",
+            "passport_requested",
+            "missing_actions",
+        ]
+    )
+
+
 def render_report_html(source: dict[str, Any] | "CallCandidate", analysis: dict[str, Any]) -> str:
     if isinstance(source, dict):
         lead_id = int(source.get("lead_id") or 0)
@@ -2128,6 +2171,31 @@ def render_report_html(source: dict[str, Any] | "CallCandidate", analysis: dict[
         call_time = source.call_time
         duration = source.duration
         pipeline_status = source.pipeline_status
+
+    if is_sales_analysis(analysis):
+        lead_href = html.escape(str(lead_url), quote=True)
+        lines = [
+            "<b>Анализ продажи</b>",
+            "",
+            f'<a href="{lead_href}">{h(lead_name)}</a>',
+            f"<b>Менеджер:</b> {h(manager_name)}",
+            f"<b>Дата звонка:</b> {h(fmt_dt(call_time))}",
+            f"<b>Этап:</b> {h(pipeline_status)}",
+            "",
+        ]
+        blocks = [
+            ("Выявил ситуацию клиента", analysis.get("client_situation_discovered")),
+            ("Назвал стоимость", analysis.get("price_named")),
+            ("Уточнил возражения", analysis.get("objections_clarified")),
+            ("Закрыл возражения", analysis.get("objections_closed")),
+            ("Запросил паспортные данные", analysis.get("passport_requested")),
+            ("Согласовал следующий шаг", analysis.get("next_step")),
+        ]
+        for title, value in blocks:
+            lines.extend(sales_check_lines(title, value))
+            lines.append("")
+        lines.extend(missing_action_lines(analysis.get("missing_actions")))
+        return fit_html_lines(lines)
 
     substantive = "да" if analysis.get("is_substantive") else "нет"
     confidence = analysis.get("confidence", "не указана")
@@ -2162,6 +2230,45 @@ def render_report_html(source: dict[str, Any] | "CallCandidate", analysis: dict[
 
 
 def render_report(candidate: CallCandidate, analysis: dict[str, Any]) -> str:
+    if is_sales_analysis(analysis):
+        lines = [
+            "Анализ продажи",
+            candidate.lead_name,
+            f"Ссылка: {candidate.lead_url}",
+            f"Менеджер: {candidate.manager_name}",
+            f"Дата звонка: {fmt_dt(candidate.call_time)}",
+            f"Этап: {candidate.pipeline_status}",
+            "",
+        ]
+        for title, key in [
+            ("Выявил ситуацию клиента", "client_situation_discovered"),
+            ("Назвал стоимость", "price_named"),
+            ("Уточнил возражения", "objections_clarified"),
+            ("Закрыл возражения", "objections_closed"),
+            ("Запросил паспортные данные", "passport_requested"),
+            ("Согласовал следующий шаг", "next_step"),
+        ]:
+            value = analysis.get(key)
+            if isinstance(value, dict):
+                status = value.get("value") or value.get("action") or "не указано"
+                quote = str(value.get("quote") or "").strip()
+            else:
+                status = value or "не указано"
+                quote = ""
+            lines.append(f"{title}: {status}")
+            if quote:
+                lines.append(f'"{quote}"')
+            lines.append("")
+        lines.append("Недостающие действия:")
+        missing_actions = analysis.get("missing_actions") or []
+        if isinstance(missing_actions, list) and missing_actions:
+            lines.extend(f"- {item}" for item in missing_actions)
+        elif missing_actions:
+            lines.append(f"- {missing_actions}")
+        else:
+            lines.append("- нет")
+        return "\n".join(lines)
+
     lines = [
         "Анализ звонка",
         f"Сделка: {candidate.lead_name}",
