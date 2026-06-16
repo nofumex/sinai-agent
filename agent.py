@@ -156,6 +156,25 @@ def env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+class RequestRateLimiter:
+    def __init__(self, requests_per_second: float) -> None:
+        self.requests_per_second = max(float(requests_per_second), 0.1)
+        self._min_gap = 1.0 / self.requests_per_second
+        self._lock = threading.Lock()
+        self._last_request_at = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            wait_for = self._min_gap - (now - self._last_request_at)
+            if wait_for > 0:
+                time.sleep(wait_for)
+            self._last_request_at = time.monotonic()
+
+
+AMO_REQUEST_LIMITER = RequestRateLimiter(env_int("AMOCRM_RPS_LIMIT", 6))
+
+
 def min_transcript_chars_for_duration(duration_seconds: int) -> int:
     if duration_seconds < env_int("CALL_MIN_DURATION_SECONDS", 300):
         return 0
@@ -506,15 +525,35 @@ class AmoClient:
             ids = [self.sales_pipeline_id, self.legal_pipeline_id]
         return list(dict.fromkeys(ids))
 
+    def _retry_delay_seconds(self, response: requests.Response | None, attempt: int) -> float:
+        if response is not None:
+            retry_after = (response.headers.get("Retry-After") or "").strip()
+            if retry_after.isdigit():
+                return max(float(retry_after), 1.0)
+        return min(2.0 * attempt, 15.0)
+
     def _get(self, path: str, params: list[tuple[str, str]] | dict[str, Any] | None = None) -> Any:
         logger.debug("amoCRM GET {} params={}", path, params)
         last_error: Exception | None = None
         for attempt in range(1, 4):
             try:
+                AMO_REQUEST_LIMITER.wait()
                 response = self.session.get(f"{self.base_url}{path}", params=params, timeout=40)
                 logger.debug("amoCRM response {} {} bytes for {}", response.status_code, len(response.content), path)
                 if response.status_code == 204:
                     return {}
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    if attempt < 3:
+                        delay = self._retry_delay_seconds(response, attempt)
+                        logger.warning(
+                            "amoCRM GET retryable status {} attempt {}/3 for {}. Sleeping {}s",
+                            response.status_code,
+                            attempt,
+                            path,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
                 response.raise_for_status()
                 return json.loads(response.content.decode("utf-8"))
             except requests.RequestException as exc:

@@ -57,6 +57,7 @@ Optional env vars:
 - `MIN_TRANSCRIPT_CHARS`, default `350`
 - `MONITOR_INTERVAL_SECONDS`, default `300`
 - `MONITOR_LOOKBACK_MINUTES`, default `20`
+- `AMOCRM_RPS_LIMIT`, default `6`
 - `AMOCRM_SALES_PIPELINE_ID`, default `867829`
 - `AMOCRM_LEGAL_PIPELINE_ID`, default `1312204`
 - `AMOCRM_PIPELINE_IDS`, optional comma-separated override for target pipelines
