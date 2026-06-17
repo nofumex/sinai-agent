@@ -316,8 +316,16 @@ class Store:
 
     def has_processed_call(self, note_id: int) -> bool:
         with self.lock, self.connect() as conn:
-            row = conn.execute("select 1 from calls where note_id = ?", (note_id,)).fetchone()
+            row = conn.execute(
+                "select 1 from calls where note_id = ? and status = 'done' and analysis_path is not null",
+                (note_id,),
+            ).fetchone()
             return row is not None
+
+    def delete_call(self, note_id: int) -> int:
+        with self.lock, self.connect() as conn:
+            row = conn.execute("delete from calls where note_id = ?", (note_id,))
+            return int(row.rowcount or 0)
 
     def lead_has_substantive(self, lead_id: int) -> bool:
         with self.lock, self.connect() as conn:
@@ -1590,6 +1598,9 @@ class TelegramBot:
         if text.startswith("/reset_db"):
             self.awaiting_lead_search = False
             self.reset_db()
+        elif text.startswith("/retry_note"):
+            self.awaiting_lead_search = False
+            self.retry_note(text)
         elif self.awaiting_lead_search:
             self.awaiting_lead_search = False
             self.handle_lead_search_text(text)
@@ -1612,6 +1623,25 @@ class TelegramBot:
             "Файлы audio/transcripts/analysis на диске не удалялись. Теперь можно заново запускать анализ.",
             self.panel_markup(),
         )
+
+    def retry_note(self, text: str) -> None:
+        match = re.search(r"\d{5,}", text)
+        if not match:
+            self.send("Нужно указать note_id, например: /retry_note 356975743", self.panel_markup())
+            return
+        note_id = int(match.group(0))
+        deleted = self.store.delete_call(note_id)
+        logger.warning("Call row reset by admin for retry: note_id={} deleted_rows={}", note_id, deleted)
+        if deleted:
+            self.send(
+                f"Запись по звонку note_id={note_id} сброшена. При следующем прогоне звонок сможет попасть в анализ заново.",
+                self.panel_markup(),
+            )
+        else:
+            self.send(
+                f"Запись по note_id={note_id} в локальной базе не найдена. Если звонок подходит по фильтрам и окну времени, он и так будет найден заново.",
+                self.panel_markup(),
+            )
 
     def handle_callback(self, data: str, callback_message: dict[str, Any] | None = None) -> None:
         callback_message_id = int((callback_message or {}).get("message_id") or 0) or None
